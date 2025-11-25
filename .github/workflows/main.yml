@@ -14,16 +14,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Generate a strong password (16 chars) using python3
-          PASSWORD=$(python3 - <<'PY'
-import secrets, string
-chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*()-_=+[]{}<>?"
-print(''.join(secrets.choice(chars) for _ in range(16)))
-PY
-)
-          echo "Generated password (first 8 chars may be used for legacy VNC): ${PASSWORD}"
-
-          # Create admin user 'RDP'
+          # Generate a strong password (16 chars) using python -c (avoids heredoc issues)
+          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*()-_=+[]{}<>?"; print("".join(secrets.choice(chars) for _ in range(16)))')
+          echo "Generated password"
           sudo sysadminctl -addUser RDP -fullName "RDP User" -password "${PASSWORD}" -admin
 
           # Export credentials to workflow environment
@@ -37,18 +30,15 @@ PY
         run: |
           set -euo pipefail
 
-          # Activate Remote Management for the new user and grant full privileges
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on -users RDP -privs -all -restart -agent -menu
 
-          # For legacy VNC clients: use first 8 chars as VNC password (many VNC implementations expect 8)
+          # Legacy VNC password usually limited to first 8 chars
           VNC_PW="${RDP_PASSWORD:0:8}"
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${VNC_PW}" -restart -agent -privs -all
 
-          # Confirm service
           sudo launchctl print system/com.apple.screensharing || true
-          echo "VNC password (legacy, first 8 chars): ${VNC_PW}"
           echo "VNC_PORT=5900" >> $GITHUB_ENV
 
       - name: Install Tailscale (Homebrew) and start tailscaled
@@ -61,10 +51,7 @@ PY
             eval "$(/opt/homebrew/bin/brew shellenv || true)"
           fi
 
-          # install tailscale (cask on Intel/Apple silicon variations handled by brew)
           brew install --cask tailscale || brew install tailscale || true
-
-          # start tailscaled
           sudo tailscaled > /tmp/tailscaled.log 2>&1 & sleep 2
 
       - name: Establish Tailscale connection
@@ -76,7 +63,6 @@ PY
 
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes
 
-          # capture tailscale IP
           TAILSCALE_IP=$(tailscale ip -4 || tailscale ip | head -n1 || true)
           if [ -z "${TAILSCALE_IP}" ]; then
             tail -n 200 /tmp/tailscaled.log || true
@@ -106,7 +92,6 @@ PY
           echo "VNC Port: 5900"
           echo "Username: RDP"
           echo "Password (user): ${{ env.RDP_PASSWORD }}"
-          # safely print first 8 chars for VNC legacy password
           echo "VNC legacy password (first 8 chars): ${RDP_PASSWORD:0:8}"
           echo "=============================="
 
