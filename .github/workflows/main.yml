@@ -1,12 +1,7 @@
-name: RDP-mac-manual-auth-with-input
+name: RDP-mac-manual-auth
 
 on:
   workflow_dispatch:
-    inputs:
-      auth_url:
-        description: '(optional) Paste the Tailscale interactive auth URL you received (e.g. https://login.tailscale.com/a/...)'
-        required: false
-        default: ''
 
 jobs:
   secure-rdp:
@@ -18,123 +13,104 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+[]{}"; print("".join(secrets.choice(chars) for _ in range(16)))')
-          echo "RDP user password generated"
-          sudo sysadminctl -addUser RDP -fullName "RDP User" -password "${PASSWORD}" -admin
+          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_letters + string.digits + "!@#$%^&*()"; print("".join(secrets.choice(chars) for _ in range(16)))')
           echo "RDP_USER=RDP" >> $GITHUB_ENV
           echo "RDP_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+          sudo sysadminctl -addUser RDP -fullName "RDP User" -password "${PASSWORD}" -admin
 
       - name: Enable Screen Sharing and set VNC password
         shell: bash
         env:
           RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
         run: |
-          set -euo pipefail
+          VNC_PW="${RDP_PASSWORD:0:8}"
+
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on -users RDP -privs -all -restart -agent -menu
-          VNC_PW="${RDP_PASSWORD:0:8}"
+
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${VNC_PW}" -restart -agent
+            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PW" -restart -agent
+
           echo "VNC_PORT=5900" >> $GITHUB_ENV
 
       - name: Install Tailscale
         shell: bash
         run: |
-          set -euo pipefail
           if ! command -v brew >/dev/null 2>&1; then
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            eval "$(/opt/homebrew/bin/brew shellenv || true)"
+            eval "$(/opt/homebrew/bin/brew shellenv)"
           fi
+
           brew install --cask tailscale || brew install tailscale || true
 
-      - name: Start tailscaled in userspace networking mode
+      - name: Start tailscaled (userspace networking)
         shell: bash
         run: |
-          set -euo pipefail
           sudo tailscaled --tun=userspace-networking > /tmp/tailscaled.log 2>&1 &
           sleep 2
-          echo "tailscaled started in userspace mode"
 
-      - name: Trigger tailscale up or print provided AUTH URL
-        shell: bash
-        env:
-          INPUT_AUTH_URL: ${{ github.event.inputs.auth_url }}
-        run: |
-          set -euo pipefail
-
-          # If user provided an auth_url in workflow_dispatch input, just show it and do not call 'tailscale up' without authkey.
-          if [ -n "${INPUT_AUTH_URL}" ]; then
-            echo "User provided AUTH URL via workflow input:"
-            echo "${INPUT_AUTH_URL}"
-            echo "Open this URL on your device with the Tailscale app (App Store link: https://apps.apple.com/ca/app/tailscale/id1475387142?mt=12) and approve the new device."
-            # Still run 'tailscale up' without authkey to make the runner attempt registration; it will wait for approval.
-            sudo tailscale up --hostname="gh-mac-${GITHUB_RUN_ID}" --accept-routes=false --accept-dns=false 2>&1 | tee /tmp/tailscale_up.log &
-          else
-            # No auth_url provided: run tailscale up and capture any interactive URL from the output
-            sudo tailscale up --hostname="gh-mac-${GITHUB_RUN_ID}" --accept-routes=false --accept-dns=false 2>&1 | tee /tmp/tailscale_up.log &
-            sleep 2
-            LOGIN_URL=$(grep -Eo 'https://login[^\ ]+/a/[0-9a-zA-Z_-]+' /tmp/tailscale_up.log | head -n1 || true)
-            if [ -n "${LOGIN_URL}" ]; then
-              echo "Interactive AUTH URL found (open on your device to approve):"
-              echo "${LOGIN_URL}"
-            else
-              echo "No interactive AUTH URL printed. If your Tailscale requires admin approval, please approve the device from the Tailscale admin console."
-              tail -n 80 /tmp/tailscale_up.log || true
-            fi
-          fi
-
-      - name: Wait for Tailscale IP (approve via provided link or admin console)
+      - name: Use YOUR manual auth link (update this every rerun)
         shell: bash
         run: |
           set -euo pipefail
-          MAX_SECONDS=1800
-          INTERVAL=5
+
+          ##############################################
+          ##  EDIT THIS LINE BEFORE EVERY WORKFLOW RUN
+          ##############################################
+          AUTH_URL="https://apps.apple.com/ca/app/tailscale/id1475387142?mt=12"
+          ##############################################
+
+          echo "Using your manual Tailscale auth URL:"
+          echo "$AUTH_URL"
+          echo ""
+          echo "Open this URL on your Mac / iPhone with Tailscale installed and approve the new device."
+          echo "Waiting for approval..."
+
+          # begin tailscale registration WITHOUT authkey (forces interactive mode)
+          sudo tailscale up --hostname="gh-mac-${GITHUB_RUN_ID}" --accept-routes=false --accept-dns=false >/tmp/tailscale_up.log 2>&1 &
+
+      - name: Wait for Tailscale IP (after you approve manually)
+        shell: bash
+        run: |
+          MAX_WAIT=1800
           ELAPSED=0
-          echo "Waiting up to $MAX_SECONDS seconds for Tailscale IP assignment..."
-          while [ $ELAPSED -lt $MAX_SECONDS ]; do
-            TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
-            if [ -n "$TS_IP" ]; then
-              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-              echo "Tailscale IP obtained: $TS_IP"
+
+          echo "Waiting for Tailscale IP assignment… (approve using your link)"
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            IP=$(tailscale ip -4 2>/dev/null | head -n1)
+            if [ -n "$IP" ]; then
+              echo "TAILSCALE_IP=$IP" >> $GITHUB_ENV
+              echo "Connected! IP = $IP"
               exit 0
             fi
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED + INTERVAL))
+
+            sleep 5
+            ELAPSED=$((ELAPSED+5))
+
             if [ $((ELAPSED % 60)) -eq 0 ]; then
-              echo "Still waiting... ($ELAPSED sec). If you provided an AUTH URL, open it on your device now. Or approve the device from Tailscale admin console."
+              echo "Still waiting... ($ELAPSED sec). Approve using your URL."
             fi
           done
-          echo "Timed out waiting for Tailscale IP. Dumping logs:"
+
+          echo "Timed out waiting for device approval."
           tail -n 200 /tmp/tailscaled.log || true
-          tail -n 200 /tmp/tailscale_up.log || true
           exit 1
 
-      - name: Verify VNC (5900) accessibility
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Testing VNC port on ${{ env.TAILSCALE_IP }}:5900"
-          if command -v nc >/dev/null 2>&1; then
-            nc -zv "${{ env.TAILSCALE_IP }}" 5900 || echo "Warning: nc indicates port 5900 may not be open."
-          else
-            timeout 5 bash -c ">/dev/tcp/${{ env.TAILSCALE_IP }}/5900" && echo "Port 5900 reachable" || echo "Warning: port 5900 not reachable"
-          fi
-
-      - name: Print access info and keep runner alive
+      - name: Print Access Info + Keep alive
         shell: bash
         env:
           RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
         run: |
-          set -euo pipefail
-          echo "======== macOS RDP/VNC ACCESS ========"
+          echo "====== macOS RDP/VNC ACCESS ======"
           echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
           echo "User: RDP"
           echo "Password: ${RDP_PASSWORD}"
           echo "VNC Password (first 8 chars): ${RDP_PASSWORD:0:8}"
-          echo "VNC Port: 5900"
-          echo "======================================"
-          echo "Open the Tailscale app on your Mac (App Store: https://apps.apple.com/ca/app/tailscale/id1475387142?mt=12) and approve the device using the AUTH URL printed earlier."
+          echo "Port: 5900"
+          echo "=================================="
+
           while true; do
-            echo "[$(date)] macOS runner alive — cancel workflow in Actions to terminate"
+            echo "[$(date)] macOS runner alive..."
             sleep 300
           done
