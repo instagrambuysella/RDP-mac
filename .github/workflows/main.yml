@@ -9,93 +9,102 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Generate credentials and create local RDP user
+      - name: Create RDP user and password
         shell: bash
         run: |
           set -euo pipefail
 
-          # Generate a strong password (16 chars) using python -c (avoids heredoc issues)
-          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*()-_=+[]{}<>?"; print("".join(secrets.choice(chars) for _ in range(16)))')
+          # Generate strong password
+          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_letters + string.digits + "!@#$%^&*()"; print("".join(secrets.choice(chars) for _ in range(16)))')
           echo "Generated password"
+
+          # Create admin user
           sudo sysadminctl -addUser RDP -fullName "RDP User" -password "${PASSWORD}" -admin
 
-          # Export credentials to workflow environment
+          # Export for later steps
           echo "RDP_USER=RDP" >> $GITHUB_ENV
           echo "RDP_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
 
-      - name: Enable Apple Remote Management (Screen Sharing / VNC) and set VNC password
+      - name: Enable Screen Sharing + Set VNC Password
         shell: bash
         env:
           RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
         run: |
           set -euo pipefail
 
+          # Enable screen sharing for RDP
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on -users RDP -privs -all -restart -agent -menu
 
-          # Legacy VNC password usually limited to first 8 chars
+          # VNC password = first 8 chars (macOS VNC limit)
           VNC_PW="${RDP_PASSWORD:0:8}"
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${VNC_PW}" -restart -agent -privs -all
 
-          sudo launchctl print system/com.apple.screensharing || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PW" -restart -agent
+
           echo "VNC_PORT=5900" >> $GITHUB_ENV
 
-      - name: Install Tailscale (Homebrew) and start tailscaled
+      - name: Install Tailscale
         shell: bash
         run: |
           set -euo pipefail
 
+          # Install Homebrew if missing
           if ! command -v brew >/dev/null 2>&1; then
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
             eval "$(/opt/homebrew/bin/brew shellenv || true)"
           fi
 
           brew install --cask tailscale || brew install tailscale || true
-          sudo tailscaled > /tmp/tailscaled.log 2>&1 & sleep 2
 
-      - name: Establish Tailscale connection
+      - name: Start Tailscale in Userspace Networking mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Userspace mode = works on GitHub macOS runners
+          sudo tailscaled --tun=userspace-networking > /tmp/tailscale.log 2>&1 &
+          sleep 3
+
+      - name: Connect to Tailscale
         shell: bash
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
 
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTH_KEY}" \
+            --hostname="gh-mac-${GITHUB_RUN_ID}" \
+            --accept-routes=false \
+            --accept-dns=false
 
-          TAILSCALE_IP=$(tailscale ip -4 || tailscale ip | head -n1 || true)
-          if [ -z "${TAILSCALE_IP}" ]; then
-            tail -n 200 /tmp/tailscaled.log || true
-            echo "Tailscale IP not assigned"
-            exit 1
-          fi
-          echo "TAILSCALE_IP=${TAILSCALE_IP}" >> $GITHUB_ENV
+          # Capture Tailscale IP
+          TS_IP=$(tailscale ip -4 | head -n1)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Verify VNC (5900) accessibility over Tailscale
+          echo "Connected! IP = $TS_IP"
+          tailscale status
+
+      - name: Verify VNC Port
         shell: bash
         run: |
-          set -euo pipefail
+          echo "Testing port 5900..."
+          nc -zv ${{ env.TAILSCALE_IP }} 5900 || true
 
+      - name: Print Access Info + Keep Alive
+        shell: bash
+        run: |
+          echo "======== macOS RDP/VNC ACCESS ========"
           echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          if command -v nc >/dev/null 2>&1; then
-            nc -zv "${{ env.TAILSCALE_IP }}" 5900 || { echo "TCP connectivity to port 5900 failed"; exit 1; }
-          else
-            timeout 5 bash -c ">/dev/tcp/${{ env.TAILSCALE_IP }}/5900" || { echo "TCP connectivity to port 5900 failed (no nc)"; exit 1; }
-          fi
-          echo "TCP connectivity to VNC port successful."
-
-      - name: Print access info and keep runner active
-        shell: bash
-        run: |
-          echo "=== RDP (macOS VNC) ACCESS ==="
-          echo "Address (Tailscale): ${{ env.TAILSCALE_IP }}"
+          echo "User: RDP"
+          echo "Password: ${{ env.RDP_PASSWORD }}"
+          echo "VNC Password (8 chars): ${RDP_PASSWORD:0:8}"
           echo "VNC Port: 5900"
-          echo "Username: RDP"
-          echo "Password (user): ${{ env.RDP_PASSWORD }}"
-          echo "VNC legacy password (first 8 chars): ${RDP_PASSWORD:0:8}"
-          echo "=============================="
+          echo "======================================"
 
+          # Prevent runner from closing
           while true; do
-            echo "[$(date)] RDP (VNC) active — sleeping 300s"
+            echo "[$(date)] macOS active..."
             sleep 300
           done
