@@ -1,116 +1,154 @@
-name: RDP-mac-manual-auth
+name: VNC macOS
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  secure-vnc:
     runs-on: macos-latest
-    timeout-minutes: 1440
+    timeout-minutes: 3600
 
     steps:
-      - name: Create RDP user and generate password
-        shell: bash
+      - name: Enable Screen Sharing (VNC)
         run: |
-          set -euo pipefail
-          PASSWORD=$(python3 -c 'import secrets, string; chars = string.ascii_letters + string.digits + "!@#$%^&*()"; print("".join(secrets.choice(chars) for _ in range(16)))')
-          echo "RDP_USER=RDP" >> $GITHUB_ENV
-          echo "RDP_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
-          sudo sysadminctl -addUser RDP -fullName "RDP User" -password "${PASSWORD}" -admin
+          # Enable VNC/Screen Sharing
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -configure -allowAccessFor -allUsers \
+            -configure -clientopts -setvnclegacy -vnclegacy yes \
+            -configure -clientopts -setvncpw -vncpw mypassword123 \
+            -restart -agent -privs -all
+          
+          # Enable remote management
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          
+          # Configure VNC password (for legacy VNC clients)
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes \
+            -configure -clientopts -setvncpw -vncpw mypassword123
 
-      - name: Enable Screen Sharing and set VNC password
-        shell: bash
-        env:
-          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+      - name: Create RDP/VNC User
         run: |
-          VNC_PW="${RDP_PASSWORD:0:8}"
-
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -users RDP -privs -all -restart -agent -menu
-
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PW" -restart -agent
-
-          echo "VNC_PORT=5900" >> $GITHUB_ENV
-
+          # Generate random password
+          PASSWORD=$(openssl rand -base64 16 | tr -d '=+/' | cut -c1-16)
+          USERNAME="remoteuser"
+          
+          # Create user
+          sudo sysadminctl -addUser $USERNAME -password "$PASSWORD" -admin
+          
+          # Store credentials
+          echo "VNC_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
+          echo "Legacy VNC Password: mypassword123" >> $GITHUB_ENV
+          
+          echo "User created: $USERNAME"
+          
       - name: Install Tailscale
-        shell: bash
         run: |
-          if ! command -v brew >/dev/null 2>&1; then
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-          fi
+          # Download and install Tailscale
+          TS_URL="https://pkgs.tailscale.com/stable/Tailscale-1.82.0-macos-amd64.zip"
+          curl -o tailscale.zip $TS_URL
+          unzip tailscale.zip -d /tmp/tailscale
+          
+          # Install Tailscale
+          sudo installer -pkg /tmp/tailscale/Tailscale.pkg -target /
+          
+          # Clean up
+          rm -rf tailscale.zip /tmp/tailscale
 
-          brew install --cask tailscale || brew install tailscale || true
-
-      - name: Start tailscaled (userspace networking)
-        shell: bash
+      - name: Establish Tailscale Connection
         run: |
-          sudo tailscaled --tun=userspace-networking > /tmp/tailscaled.log 2>&1 &
-          sleep 2
+          # Start Tailscale
+          sudo tailscaled &
+          sleep 5
+          
+          # Connect to Tailscale network
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-macos-${{ github.run_id }}
+          
+          # Get Tailscale IP
+          sleep 10
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+          
+          # Display network info
+          tailscale status
 
-      - name: Use YOUR manual auth link (update this every rerun)
-        shell: bash
+      - name: Configure Firewall for VNC
         run: |
-          set -euo pipefail
+          # Allow VNC (port 5900) through firewall
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/com.apple.screensharing.agent
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/com.apple.screensharing.agent
+          
+          # Also allow legacy VNC
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/vncserver
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/vncserver
+          
+          echo "Firewall configured for VNC"
 
-          ##############################################
-          ##  EDIT THIS LINE BEFORE EVERY WORKFLOW RUN
-          ##############################################
-          AUTH_URL="https://apps.apple.com/ca/app/tailscale/id1475387142?mt=12"
-          ##############################################
-
-          echo "Using your manual Tailscale auth URL:"
-          echo "$AUTH_URL"
-          echo ""
-          echo "Open this URL on your Mac / iPhone with Tailscale installed and approve the new device."
-          echo "Waiting for approval..."
-
-          # begin tailscale registration WITHOUT authkey (forces interactive mode)
-          sudo tailscale up --hostname="gh-mac-${GITHUB_RUN_ID}" --accept-routes=false --accept-dns=false >/tmp/tailscale_up.log 2>&1 &
-
-      - name: Wait for Tailscale IP (after you approve manually)
-        shell: bash
+      - name: Start Screen Sharing Service
         run: |
-          MAX_WAIT=1800
-          ELAPSED=0
+          # Ensure screen sharing is running
+          sudo launchctl unload /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          
+          # Also enable for current user
+          sudo launchctl enable system/com.apple.screensharing
+          
+          echo "Screen Sharing service started"
 
-          echo "Waiting for Tailscale IP assignment… (approve using your link)"
-
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            IP=$(tailscale ip -4 2>/dev/null | head -n1)
-            if [ -n "$IP" ]; then
-              echo "TAILSCALE_IP=$IP" >> $GITHUB_ENV
-              echo "Connected! IP = $IP"
-              exit 0
-            fi
-
-            sleep 5
-            ELAPSED=$((ELAPSED+5))
-
-            if [ $((ELAPSED % 60)) -eq 0 ]; then
-              echo "Still waiting... ($ELAPSED sec). Approve using your URL."
-            fi
-          done
-
-          echo "Timed out waiting for device approval."
-          tail -n 200 /tmp/tailscaled.log || true
-          exit 1
-
-      - name: Print Access Info + Keep alive
-        shell: bash
-        env:
-          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+      - name: Verify VNC Accessibility
         run: |
-          echo "====== macOS RDP/VNC ACCESS ======"
+          echo "Testing VNC connectivity..."
+          
+          # Check if service is listening
+          NETSTAT=$(sudo lsof -i :5900 || echo "Checking...")
+          echo "Listening ports:"
+          sudo lsof -i :5900 || echo "Port 5900 not found, checking launchctl..."
+          
+          # Check service status
+          sudo launchctl list | grep screensharing || echo "Checking alternative..."
+          
           echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          echo "User: RDP"
-          echo "Password: ${RDP_PASSWORD}"
-          echo "VNC Password (first 8 chars): ${RDP_PASSWORD:0:8}"
-          echo "Port: 5900"
-          echo "=================================="
+          echo "VNC should be accessible at: ${{ env.TAILSCALE_IP }}:5900"
 
-          while true; do
-            echo "[$(date)] macOS runner alive..."
-            sleep 300
+      - name: Display Connection Instructions
+        run: |
+          echo ""
+          echo "==============================================="
+          echo "           macOS VNC ACCESS INFORMATION        "
+          echo "==============================================="
+          echo "Connect via Tailscale VPN using:"
+          echo "VNC Address: ${{ env.TAILSCALE_IP }}:5900"
+          echo ""
+          echo "Authentication Options:"
+          echo "1. For macOS Screen Sharing/VNC Viewer:"
+          echo "   Username: $(echo ${{ env.VNC_CREDS }} | cut -d'|' -f1 | cut -d':' -f2-)"
+          echo "   Password: $(echo ${{ env.VNC_CREDS }} | cut -d'|' -f2 | cut -d':' -f2-)"
+          echo ""
+          echo "2. For legacy VNC clients (like RealVNC, TightVNC):"
+          echo "   Password: mypassword123"
+          echo "   (No username required for legacy VNC)"
+          echo ""
+          echo "Recommended VNC Clients:"
+          echo "- Built-in Screen Sharing app (macOS)"
+          echo "- RealVNC Viewer"
+          echo "- TigerVNC"
+          echo "- Remmina (Linux)"
+          echo "==============================================="
+          echo ""
+          echo "Note: The runner will stay active for 60 minutes"
+          echo "or until manually cancelled in GitHub Actions."
+
+      - name: Maintain Connection
+        run: |
+          # Keep the runner alive
+          echo "Runner is active. VNC is available via Tailscale."
+          echo "Press Ctrl+C in the workflow log to terminate."
+          
+          # Simple keep-alive loop
+          COUNTER=0
+          while [ $COUNTER -lt 720 ]; do  # 720 * 5 seconds = 60 minutes
+              echo "[$(date)] VNC session active - ${COUNTER}/720 checks"
+              sleep 5
+              COUNTER=$((COUNTER + 1))
           done
